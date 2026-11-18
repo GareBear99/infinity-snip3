@@ -223,6 +223,8 @@ async function loadSoundEffects() {
  * @returns {AudioBufferSourceNode|null} - Source node (for stopping later)
  */
 function playSound(category, soundName, options = {}) {
+  // No audio context yet (initAudioSystem not called) — nothing to play.
+  if (!audioContext) return null;
   // Check if category is enabled
   const categoryEnabled = AudioSettings[`${category}Enabled`];
   if (!categoryEnabled) return null;

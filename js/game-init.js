@@ -31,7 +31,7 @@
  * Central game state - shared across all modules
  * This replaces the need for scattered global variables
  */
-const GameState = {
+const Snip3GameState = {
   // Core game objects
   players: [],
   lasers: [],
@@ -125,8 +125,8 @@ async function initGame(canvas, options = {}) {
   console.log('═══════════════════════════════════════════════════════');
   
   // Store canvas reference
-  GameState.canvas = canvas;
-  GameState.ctx = canvas.getContext('2d');
+  Snip3GameState.canvas = canvas;
+  Snip3GameState.ctx = canvas.getContext('2d');
   
   // 1. Platform Detection
   try {
@@ -151,7 +151,7 @@ async function initGame(canvas, options = {}) {
     if (typeof AudioControl !== 'undefined') {
       await AudioControl.initAudioSystem();
       InitStatus.audio = true;
-      GameState.audioUnlocked = true;
+      Snip3GameState.audioUnlocked = true;
       console.log('[INIT] ✓ Audio system initialized');
     } else {
       console.warn('[INIT] ⚠ AudioControl not available');
@@ -186,14 +186,14 @@ async function initGame(canvas, options = {}) {
       NetworkAPI.initNetwork({
         onPeerConnected: (playerId) => {
           console.log(`[NETWORK] Player ${playerId + 1} connected`);
-          GameState.isOnline = true;
+          Snip3GameState.isOnline = true;
         },
         onPeerDisconnected: (playerId) => {
           console.log(`[NETWORK] Player ${playerId + 1} disconnected`);
         },
         onHostMigration: (newHostId) => {
           console.log(`[NETWORK] Host migrated to Player ${newHostId + 1}`);
-          GameState.isHost = (newHostId === NetworkAPI.NetworkState.myPlayerId);
+          Snip3GameState.isHost = (newHostId === NetworkAPI.NetworkState.myPlayerId);
         },
         onMessage: (message) => {
           // Handle custom messages (music streaming, chat, etc.)
@@ -297,12 +297,12 @@ function handleNetworkMessage(message) {
  * @param {number} dt - Delta time in seconds
  */
 function updateGameState(dt) {
-  GameState.deltaTime = dt;
-  GameState.tSec += dt;
+  Snip3GameState.deltaTime = dt;
+  Snip3GameState.tSec += dt;
   
   // Update game modes (handles respawning, bounds checking)
-  if (typeof GameModeManager !== 'undefined' && GameState.appMode === 'GAME') {
-    GameModeManager.update(GameState.players, dt);
+  if (typeof GameModeManager !== 'undefined' && Snip3GameState.appMode === 'GAME') {
+    GameModeManager.update(Snip3GameState.players, dt);
   }
   
   // Update touch controls
@@ -315,21 +315,21 @@ function updateGameState(dt) {
   }
   
   // Update network (send inputs, receive state)
-  if (GameState.isOnline && typeof NetworkAPI !== 'undefined') {
-    if (!GameState.isHost) {
+  if (Snip3GameState.isOnline && typeof NetworkAPI !== 'undefined') {
+    if (!Snip3GameState.isHost) {
       // Client: send inputs
       if (typeof updateInputSystem === 'function') {
         updateInputSystem(dt, {
-          keys: GameState.keys,
-          mouseDown: GameState.mouseDown,
-          aimAngle: GameState.aimAngle,
+          keys: Snip3GameState.keys,
+          mouseDown: Snip3GameState.mouseDown,
+          aimAngle: Snip3GameState.aimAngle,
         });
       }
     }
   }
   
   // Update menu arrow
-  if (GameState.appMode === 'MENU' && typeof MenuArrow3D !== 'undefined') {
+  if (Snip3GameState.appMode === 'MENU' && typeof MenuArrow3D !== 'undefined') {
     MenuArrow3D.update(dt);
   }
   
@@ -344,13 +344,13 @@ function updateGameState(dt) {
  * @param {number} playerCount - Number of players
  */
 function resetGameState(playerCount) {
-  GameState.players = [];
-  GameState.lasers = [];
-  GameState.particles = [];
-  GameState.playerScore = new Array(playerCount).fill(0);
-  GameState.playerLives = new Array(playerCount).fill(3);
-  GameState.currentRound = 1;
-  GameState.tSec = 0;
+  Snip3GameState.players = [];
+  Snip3GameState.lasers = [];
+  Snip3GameState.particles = [];
+  Snip3GameState.playerScore = new Array(playerCount).fill(0);
+  Snip3GameState.playerLives = new Array(playerCount).fill(3);
+  Snip3GameState.currentRound = 1;
+  Snip3GameState.tSec = 0;
   
   console.log(`[GAME] Reset for ${playerCount} players`);
 }
@@ -398,8 +398,10 @@ function isFeatureSupported(feature) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 window.GameInit = {
-  // State
-  GameState,
+  // State (public key stays GameState; the internal const was renamed to
+  // Snip3GameState so it no longer collides with network-state.js's
+  // `class GameState` when both scripts load)
+  GameState: Snip3GameState,
   InitStatus,
   
   // Initialization

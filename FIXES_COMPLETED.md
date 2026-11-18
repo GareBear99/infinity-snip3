@@ -96,10 +96,10 @@ Complete integration guide with:
 ## 🔍 Remaining Items
 
 ### High Priority
-1. **Complete shape-editor.js** (file is truncated around line 480)
-   - Missing rendering code for controls section
-   - Missing export/import functionality
-   - Missing event handlers
+1. **Wire up shape-editor.js input** (corrected 2026-11-17: the file is NOT truncated — it is complete at 773 lines, with rendering, sliders, preview, and export/import all present. What it lacks is *input wiring*: it contains zero `addEventListener`/mouse handlers, so its sliders and point-dragging can never fire, and undo/redo and symmetry have no functions.)
+   - Add mouse/keyboard handlers so sliders and point-dragging work
+   - Add undo/redo functions (history state exists but is unused)
+   - Fix the shallow copy in `initShapeLibrary` (the `points` array is shared with the library preset)
 
 ### Medium Priority
 2. **Add error recovery for network disconnections**
@@ -237,6 +237,16 @@ Complete integration guide with:
 ---
 
 ## ✨ Conclusion
+
+> **Correction (2026-11-17):** the "production-ready" claim above was not true — the
+> game crashed on its first gameplay frame (player objects were missing `trail`,
+> `angMin`/`angMax` and `driftT`), `initBarriers()` was never called, and the
+> `js/` modules were never loaded. Those core issues were fixed in the 2026-11-17
+> pass (menu/game separation via a `GameConfig` draft + `startGame()`, full
+> teardown in `goMenu()`, player-field initialization, barrier wiring, network
+> dispatch/binary fixes, `GameState` name-collision fix, system-checker manifest
+> paths). The module layer is still disabled pending an integration decision,
+> and multiplayer still needs a signaling server. See the commit for the full list.
 
 The codebase is now **production-ready** with all critical bugs fixed. The new `game-init.js` module provides robust initialization, and the integration guide (`SCRIPT_LOADING_ORDER.md`) ensures proper setup.
 

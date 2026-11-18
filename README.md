@@ -119,6 +119,12 @@ window.SNIP3_NET_CONFIG = {
 };
 ```
 
+> **Module status (2026-11-17):** the `js/` modules are currently **disabled** — the
+> `<script src>` tags in `index.html` are commented out, so the game runs entirely
+> from the inline script in `index.html`. Multiplayer therefore does not run yet:
+> it needs a real signaling server (none ships in this repo) and the module layer
+> integrated first. See `SCRIPT_LOADING_ORDER.md` for the intended load order.
+
 ---
 
 ## 📁 Project Structure

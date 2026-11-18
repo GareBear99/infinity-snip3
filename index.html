@@ -531,7 +531,101 @@ function installAudioUnlockHooks(logFn){
   }
 
 
+  // ---------------------------------------------------------------------------
+  // GameConfig — the single source of truth for a run.
+  // The MENU owns a *pending draft* (what the player selected); the GAME owns
+  // only the *active* copy (what the current run was built from). Menu actions
+  // edit the draft and never touch the live world; startGame() is the one
+  // place that turns a config into a running game.
+  // ---------------------------------------------------------------------------
+  const pendingConfig = {
+    mode: 'SNIP3',   // 'SNIP3' | 'VS'
+    players: 1,      // 1..8 (SNIP3 forces 1, VS requires >= 2)
+    seed: '',        // '' = AUTO (normalized by normalizeSeed)
+    coop: false,
+  };
+  let activeConfig = null; // config the current run was built from (null in menu)
+
+  function normalizeConfig(c) {
+    const mode = (c && c.mode === 'VS') ? 'VS' : 'SNIP3';
+    let players = Math.max(1, Math.min(8, (c && c.players | 0) || 1));
+    if (mode === 'SNIP3') players = 1;
+    if (mode === 'VS') players = Math.max(2, players);
+    return {
+      mode,
+      players,
+      seed: normalizeSeed(c && c.seed != null ? c.seed : ''),
+      coop: !!(c && c.coop),
+    };
+  }
+
+  // Draft accessors — the ONLY way menu code changes the selection.
+  // They never generate or mutate the live world.
+  function setPendingPlayers(n) {
+    const nn = Math.max(1, Math.min(8, (n | 0) || 1));
+    pendingConfig.players = nn;
+    syncPlayerCountSelect();
+    return nn;
+  }
+  function setPendingSeed(s) {
+    pendingConfig.seed = normalizeSeed(s);
+    settings.seedStr = pendingConfig.seed;
+    saveSettings();
+    return pendingConfig.seed;
+  }
+  function syncPlayerCountSelect() {
+    if (playerCountSel) playerCountSel.value = String(pendingConfig.players);
+  }
+
+  // Round state that must not leak from one run (or one menu visit) to the next.
+  function resetRoundState() {
+    winnerId = -1;
+    victoryTimer = 0;
+    victoryEnterT0 = 0;
+    tSec = 0;
+    keys.clear();
+    aimMode = 'mouse';
+    aimAngle = 0;
+    pauseSel = 0;
+    pauseEnterT0 = 0;
+  }
+
+  // The ONE way a game starts. Builds the world exactly once, from a config:
+  // seed the RNG -> barriers -> players -> reset combat state -> flip to GAME.
+  function startGame(config) {
+    const c = normalizeConfig(Object.assign({}, pendingConfig, config || {}));
+    activeConfig = c;
+    stopMenuMusic();
+    resetRoundState();
+    gameMode = c.mode;
+    playerCount = c.players;
+    settings.seedStr = c.seed;
+    settings.coop = c.coop;
+    saveSettings();
+    setSeed(c.seed);      // seeds RNG *before* any generation
+    initBarriers();       // one seeded barrier per slice
+    initPlayers();        // exactly once, after seeding
+    resetP1Systems();     // lasers/sparks/charge/boost/cooldowns
+    syncPlayerCountSelect();
+    appMode = 'GAME';     // flip mode LAST, after the world exists
+    menuPage = 'MAIN';
+    setDebugVisible(false);
+    log('INFO', `Mode: ${c.mode} (${c.players}P) Seed=${currentSeed}`);
+  }
+
   function goMenu(){
+    // Tear the run down first: no game state may survive into the menu,
+    // or the next start inherits a stale world.
+    resetP1Systems();
+    resetRoundState();
+    players.length = 0;
+    barriers.length = 0;
+    lasers.length = 0;
+    sparks.length = 0;
+    activeConfig = null;
+    lobbyOverlayVisible = false;
+    lobbyHoldActive = false;
+    lobbyHoldSource = '';
     appMode = 'MENU';
     menuPage = 'MAIN';
     // Debug HUD stays hidden by default; can be enabled in Settings or via CAPSLOCK+SHIFT+TAB.
@@ -871,10 +965,11 @@ window.addEventListener('keydown', (e) => {
     return;
   }
   
-  // Tab WITHOUT CapsLock = hold-to-view lobby list (Minecraft-style)
+  // Tab WITHOUT CapsLock = hold-to-view lobby list (Minecraft-style).
+  // Only in modes that have a game/lobby to show — never during boot.
   if (tabPressed && !capsLockOn) {
     e.preventDefault();
-    if (!prevTabHeld) {
+    if (!prevTabHeld && (appMode === 'MENU' || appMode === 'GAME' || appMode === 'PAUSE')) {
       lobbyHoldActive = true;
       lobbyHoldSource = 'tab';
       showLobbyOverlay(false);
@@ -1126,8 +1221,11 @@ window.addEventListener('keyup', (e) => {
     const baseR = a.r * randRange(0.52, 0.62);
     const rot = randRange(0, TAU); // rotation inside the slice
     for (let i=0;i<playerCount;i++){
-      const angMin = (TAU * i) / playerCount;
-      const angMax = (TAU * (i+1)) / playerCount;
+      // Same angular convention as initPlayers (slice 0 starts at the top,
+      // -PI/2): the old base of 0 put each barrier 90 degrees away from the
+      // slice it belongs to.
+      const angMin = -Math.PI/2 + (TAU * i) / playerCount;
+      const angMax = -Math.PI/2 + (TAU * (i+1)) / playerCount;
       const mid = (angMin + angMax) * 0.5 + (rot * 0.06 * randSign());
       const span = (angMax - angMin);
 
@@ -1164,10 +1262,11 @@ window.addEventListener('keyup', (e) => {
 
     function barrierMidRFor(i){
       if (!barriers || !barriers[i]) return a.r*0.38;
-      const b = barriers[i];
-      const mx = (b.ax + b.bx) * 0.5;
-      const my = (b.ay + b.by) * 0.5;
-      return Math.hypot(mx, my);
+      // Barriers store absolute chord endpoints {x0,y0,x1,y1,r}; the stored
+      // r is the chord's radius from the arena centre (its midpoint sits a
+      // touch inside it). The old code read nonexistent b.ax/b.bx fields,
+      // which produced NaN spawn radii the moment a barrier existed.
+      return barriers[i].r;
     }
 
     function trySpawn(i, attempts){
@@ -1229,12 +1328,28 @@ window.addEventListener('keyup', (e) => {
         cooldown: 0,
         charge: 0,
         boost: 0,
+        // Trail state: step() pushes here every frame and drawPlayerTrail()
+        // reads it, so it must exist from spawn (it was missing entirely,
+        // which crashed the first gameplay frame).
+        trail: [],
+        trailMax: 32,
+        // Slice confinement: constrainToSlice(), drawPlayerSlices() and the
+        // no-input drift in step() all read angMin/angMax (and driftT); they
+        // were never initialized, so every coordinate turned to NaN on the
+        // first frame. sliceIndex is the 0-based slice (p.id is 1-based).
+        angMin: sliceA0 + i*sliceW,
+        angMax: sliceA0 + (i+1)*sliceW,
+        sliceIndex: i,
+        driftT: 0,
+        aimX: Math.cos(ang),
+        aimY: Math.sin(ang),
+        angle: ang,
         lastMoveX: Math.cos(ang),
         lastMoveY: Math.sin(ang),
       });
     }
 
-    log('INFO', `Initialized ${playerCount} player(s) + slices. Seed=${SETTINGS.seedStr}`);
+    log('INFO', `Initialized ${playerCount} player(s) + slices. Seed=${currentSeed}`);
   }
 
   // ---------------------------
@@ -1940,12 +2055,8 @@ function startMenuMusic(){
     if (gameMode === 'VS') {
       const alive = players.filter(pp => pp.alive);
       if (alive.length <= 1) {
-        winnerId = alive.length ? alive[0].id : byId;
-        if (winnerId == null || winnerId < 0) winnerId = 0;
-        victoryTimer = 0;
-        victoryEnterT0 = performance.now();
-        appMode = 'VICTORY';
-        log('INFO', `VS: Winner P${winnerId+1}`);
+        const w = alive.length ? alive[0].id : byId;
+        endVsRound((w == null || w < 0) ? 0 : w);
       }
     }
   }
@@ -2388,7 +2499,7 @@ function startMenuMusic(){
     if (!barriers.length) return;
     const PR = 18;
     for (const B of barriers){
-      if (B.slice !== p.id) continue; // barrier belongs to player's slice
+      if (B.slice !== p.sliceIndex) continue; // barrier belongs to player's slice (0-based; p.id is 1-based)
       const cp = closestPointOnSeg(p.x,p.y, B.x0,B.y0,B.x1,B.y1);
       const dx = p.x - cp.x;
       const dy = p.y - cp.y;
@@ -2498,20 +2609,21 @@ function startMenuMusic(){
   // ---------------------------
   // VS round state
   // ---------------------------
-  let victoryWinnerId = -1;
-  let victoryAt = 0;
-
   function aliveCount(){
     let n = 0;
     for (const p of players) if (p.alive) n++;
     return n;
   }
 
-  function endVsRound(winnerId){
-    victoryWinnerId = winnerId;
-    victoryAt = performance.now();
+  // The ONE victory transition (eliminatePlayer used to inline its own,
+  // and the old endVsRound wrote victoryWinnerId/victoryAt, which nothing
+  // read — the victory screen reads winnerId).
+  function endVsRound(w){
+    winnerId = w;
+    victoryTimer = 0;
+    victoryEnterT0 = performance.now();
     appMode = 'VICTORY';
-    log('INFO', `VS winner: P${winnerId+1}`);
+    log('INFO', `VS: Winner P${winnerId+1}`);
   }
 
   function eliminatePlayer(pid, hx, hy){
@@ -2731,7 +2843,7 @@ function startMenuMusic(){
     
   function menuItemsMain(){
     return [
-      { labelFn: (now) => snip3MenuLabel(now), action: () => { stopMenuMusic(); gameMode = 'SNIP3'; appMode = 'GAME'; menuPage='MAIN'; setPlayerCount(1); resetP1Systems(); setDebugVisible(false); setSeed(settings.seedStr); initPlayers(); log('INFO','Mode: ∞ SNIP3 (infinite sniper)'); } },
+      { labelFn: (now) => snip3MenuLabel(now), action: () => { startGame({ mode: 'SNIP3' }); log('INFO','Mode: ∞ SNIP3 (infinite sniper)'); } },
       { label: 'VS MODE', action: () => { menuPage = 'VS_PRE'; menuSel = 0; menuPageEnterT0 = performance.now(); playMenuSwitchSfx(); log('INFO','VS: Pre-menu opened'); } },
       { label: 'SETTINGS', action: () => { 
         menuPage = 'SETTINGS'; 
@@ -2752,7 +2864,7 @@ function startMenuMusic(){
   
   function menuItemsVSPre(){
     return [
-      { label: 'LOCAL VS', action: () => { stopMenuMusic(); gameMode = 'VS'; appMode = 'GAME'; menuPage = 'MAIN'; resetP1Systems(); setDebugVisible(false); setSeed(settings.seedStr); initPlayers(); log('INFO','Mode: VS (Local)'); } },
+      { label: 'LOCAL VS', action: () => { startGame({ mode: 'VS' }); log('INFO','Mode: VS (Local)'); } },
       { label: 'ONLINE VS (SOON)', action: () => { playMenuSwitchSfx(); log('INFO','Online VS: Coming soon'); } },
       { label: 'CUSTOM (SEED/CONFIG)', action: () => { menuPage = 'VS_CUSTOM'; menuSel = 0; menuPageEnterT0 = performance.now(); playMenuSwitchSfx(); } },
       { label: 'BACK', action: () => { menuPage = 'MAIN'; menuSel = 0; menuPageEnterT0 = performance.now(); playMenuSwitchSfx(); } },
@@ -2770,18 +2882,18 @@ function startMenuMusic(){
           const cur = (settings.seedStr||'').trim();
           const v = prompt('Enter a run/map seed (same seed reproduces the same layout). Leave blank for AUTO.', cur);
           if (v === null) return;
-          settings.seedStr = String(v).trim();
-          saveSettings();
-          log('INFO', settings.seedStr ? `Seed set: ${settings.seedStr}` : 'Seed: AUTO');
+          // Selection only: the world is generated at start, never from the menu.
+          setPendingSeed(String(v).trim());
+          log('INFO', pendingConfig.seed ? `Seed set: ${pendingConfig.seed}` : 'Seed: AUTO');
         }
       },
       { kind:'toggle', key:'seedOverlay', labelFn: () => `SHOW SEED OVERLAY: ${settings.seedOverlay ? 'ON' : 'OFF'}`,
         action: () => { settings.seedOverlay = !settings.seedOverlay; saveSettings(); log('INFO',`Seed overlay: ${settings.seedOverlay?'ON':'OFF'}`); }
       },
       { kind:'toggle', key:'coop', labelFn: () => `CO-OP: ${settings.coop ? 'ON' : 'OFF'}`,
-        action: () => { settings.coop = !settings.coop; if (settings.coop && playerCount < 2) setPlayerCount(2); saveSettings(); log('INFO',`CO-OP: ${settings.coop?'ON':'OFF'}`); }
+        action: () => { settings.coop = !settings.coop; pendingConfig.coop = settings.coop; if (settings.coop && pendingConfig.players < 2) setPendingPlayers(2); saveSettings(); log('INFO',`CO-OP: ${settings.coop?'ON':'OFF'}`); }
       },
-      { kind:'action', key:'start', labelFn: () => `START VS (CUSTOM)`, action: () => { stopMenuMusic(); gameMode = 'VS'; appMode = 'GAME'; menuPage='MAIN'; resetP1Systems(); setDebugVisible(false); setSeed(settings.seedStr); initPlayers(); log('INFO','Mode: VS (Custom)'); } },
+      { kind:'action', key:'start', labelFn: () => `START VS (CUSTOM)`, action: () => { startGame({ mode: 'VS' }); log('INFO','Mode: VS (Custom)'); } },
       { label: 'BACK', action: () => { menuPage = 'VS_PRE'; menuSel = 0; menuPageEnterT0 = performance.now(); playMenuSwitchSfx(); } },
     ];
   }
@@ -2805,21 +2917,19 @@ function menuItemsSettings(){
           const cur = settings.seedStr || '';
           const v = prompt('Set map/run seed (shared across all modes). Leave blank for AUTO.', cur);
           if (v === null) return;
-          const s = String(v).trim();
-          settings.seedStr = s;
-          // Apply immediately so the next start uses it (and so you can screenshot from pause/menu).
-          setSeed(s || '');
-          initPlayers();
-          resetP1Systems();
-          log('INFO', `Seed set: ${currentSeed}`);
+          // Selection only: the world is generated at start, never from the
+          // menu. (The old code re-seeded + re-spawned players behind the
+          // menu, and never saved the setting.)
+          setPendingSeed(String(v).trim());
+          log('INFO', `Seed set: ${pendingConfig.seed || 'AUTO'}`);
         }
       },
       { kind:'toggle', key:'seedOverlay', labelFn: () => `SHOW SEED ON START: ${onOff(settings.seedOverlay)}`,
         action: ()=> { settings.seedOverlay = !settings.seedOverlay; log('INFO',`Seed overlay: ${onOff(settings.seedOverlay)}`); }
       },
-      { kind:'slider', key:'players', labelFn: () => `PLAYERS: ${playerCount}`, min:1, max:8, step:1,
-        onLeft: ()=> setPlayerCount(playerCount-1),
-        onRight: ()=> setPlayerCount(playerCount+1),
+      { kind:'slider', key:'players', labelFn: () => `PLAYERS: ${pendingConfig.players}`, min:1, max:8, step:1,
+        onLeft: ()=> setPlayerCount(pendingConfig.players-1),
+        onRight: ()=> setPlayerCount(pendingConfig.players+1),
         dragFn: (t)=> { // t in [0,1]
           const v = 1 + Math.round(t*7);
           setPlayerCount(v);
@@ -3032,7 +3142,7 @@ function menuItemsSettings(){
         const x1 = layout.sliderRight;
         const yBar = y + fs*0.12;
         let tVal = 0.5;
-        if (items[i].key === 'players') tVal = clamp((playerCount-1)/7,0,1);
+        if (items[i].key === 'players') tVal = clamp((pendingConfig.players-1)/7,0,1);
         else if (items[i].key === 'brightness') tVal = clamp(((settings.brightness||0)+0.30)/0.60,0,1);
         else if (items[i].key === 'music') tVal = clamp((settings.musicVol||0),0,1);
         else if (items[i].key === 'sfx') tVal = clamp((settings.sfxVol||0),0,1);
@@ -3507,12 +3617,19 @@ function drawMenuScreen(now){
   }
 
   function setPlayerCount(n){
-    const nn = Math.max(1, Math.min(8, (n|0) || 1));
-    if (nn === playerCount) return;
-    playerCount = nn;
-    initPlayers();
-    resetP1Systems();
-    log('INFO', `Player count set to ${playerCount}`);
+    // The selection lives in the pending config. In the menu this only
+    // updates the draft — it must NOT regenerate the live world (the old
+    // behaviour respawned everyone behind the menu, and the debug DOM
+    // select could even fire mid-game). Mid-game (debug HUD) it also
+    // regenerates the live world, preserving the testing affordance.
+    const nn = setPendingPlayers(n);
+    if (appMode === 'GAME') {
+      if (nn === playerCount) return;
+      playerCount = nn;
+      initPlayers();
+      resetP1Systems();
+      log('INFO', `Player count set to ${playerCount}`);
+    }
   }
 
   // Hook dropdown
@@ -3522,7 +3639,9 @@ function drawMenuScreen(now){
     playerCountSel.addEventListener('change', () => setPlayerCount(parseInt(playerCountSel.value, 10)));
   }
 
-  initPlayers();
+  // No world exists until startGame() builds one from the pending config.
+  // (The old boot-time initPlayers() created a live game world behind the
+  // menu for no reason — the menu never reads players/barriers.)
 
   // ---------------------------
   // Update loop (fixed timestep)
@@ -4101,12 +4220,9 @@ if (mouseDown && !menuClickDown && rainbowBtnRect && rainbowBtnRect.visible && m
       const keyAny = keys.size > 0;
       const mouseAny = mouseDown;
       if (victoryTimer > 0.25 && (gpAny || keyAny || mouseAny)) {
-        // clear keys so we don't immediately re-trigger actions
-        keys.clear();
-        appMode = 'MENU';
-        menuPage = 'MAIN';
-        menuSel = 0;
-        menuPageEnterT0 = performance.now();
+        // One exit path: goMenu() tears the run down (the old inline
+        // transition skipped teardown and hardcoded menuSel = 0).
+        goMenu();
         playMenuSwitchSfx();
         startMenuMusic();
       }
@@ -4333,18 +4449,11 @@ if (mouseDown && !menuClickDown && rainbowBtnRect && rainbowBtnRect.visible && m
     game: {
       start(mode, options = {}) {
         if (!['SNIP3', 'VS'].includes(mode)) throw new Error(`Invalid mode: ${mode}`);
-        stopMenuMusic();
-        gameMode = mode;
-        appMode = 'GAME';
-        menuPage = 'MAIN';
-        
-        if (options.players) setPlayerCount(options.players);
-        if (options.seed) setSeed(options.seed);
-        if (options.coop !== undefined) settings.coop = options.coop;
-        
-        resetP1Systems();
-        setDebugVisible(false);
-        initPlayers();
+        // Single entry point: startGame() builds the world exactly once from
+        // the merged config (draft + overrides). This also fixes the old
+        // order bug (players were placed before the seed was applied) and
+        // the `seed:''` falsy bug ('' now means AUTO via normalizeSeed).
+        startGame(Object.assign({ mode }, options || {}));
         log('API', `Game started: ${mode} with ${playerCount} players`);
       },
       pause() {
@@ -4708,12 +4817,9 @@ Examples:
           console.error('Recovery: clear arrays failed', e);
         }
         
-        // Return to menu
+        // Return to menu via the one exit path (tears the run down).
         try {
-          appMode = 'MENU';
-          menuPage = 'MAIN';
-          menuSel = 0;
-          menuPageEnterT0 = performance.now();
+          goMenu();
           this.freezeCount = 0;
           log('INFO', 'WATCHDOG: Recovery complete - returned to menu');
         } catch (e) {

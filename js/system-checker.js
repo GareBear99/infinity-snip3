@@ -50,16 +50,16 @@ const FILE_MANIFEST = {
     { path: 'index.html', type: 'html', required: true },
   ],
   
-  // JavaScript modules
+  // JavaScript modules (paths are relative to the site root: js/…)
   scripts: [
-    { path: 'network.js', type: 'js', required: false, description: 'Multiplayer networking' },
-    { path: 'network-input.js', type: 'js', required: false, description: 'Input synchronization' },
-    { path: 'network-state.js', type: 'js', required: false, description: 'State broadcasting' },
-    { path: 'audio-control.js', type: 'js', required: false, description: 'Audio engine' },
-    { path: 'audio-gui.js', type: 'js', required: false, description: 'Audio controls GUI' },
-    { path: 'menu-arrow-3d.js', type: 'js', required: false, description: '3D menu arrow' },
-    { path: 'enhanced-menu.js', type: 'js', required: false, description: 'Enhanced menu system' },
-    { path: 'system-checker.js', type: 'js', required: true, description: 'System checker (this file)' },
+    { path: 'js/network.js', type: 'js', required: false, description: 'Multiplayer networking' },
+    { path: 'js/network-input.js', type: 'js', required: false, description: 'Input synchronization' },
+    { path: 'js/network-state.js', type: 'js', required: false, description: 'State broadcasting' },
+    { path: 'js/audio-control.js', type: 'js', required: false, description: 'Audio engine' },
+    { path: 'js/audio-gui.js', type: 'js', required: false, description: 'Audio controls GUI' },
+    { path: 'js/menu-arrow-3d.js', type: 'js', required: false, description: '3D menu arrow' },
+    { path: 'js/enhanced-menu.js', type: 'js', required: false, description: 'Enhanced menu system' },
+    { path: 'js/system-checker.js', type: 'js', required: true, description: 'System checker (this file)' },
   ],
   
   // Audio files
@@ -71,11 +71,9 @@ const FILE_MANIFEST = {
     { path: 'audio/the-moses-laser-cannon-182841.mp3', type: 'audio', required: false, description: 'Boot theme (TRNDSTR)' },
   ],
   
-  // Documentation (optional)
+  // Documentation (optional; only files that exist in the repo)
   docs: [
-    { path: 'CREDITS.md', type: 'doc', required: false, description: 'Credits & attribution' },
     { path: 'INTEGRATION_GUIDE.md', type: 'doc', required: false, description: 'Network integration guide' },
-    { path: 'AUDIO_INTEGRATION_GUIDE.md', type: 'doc', required: false, description: 'Audio integration guide' },
   ],
 };
 

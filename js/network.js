@@ -425,6 +425,9 @@ async function createPeerConnection(playerId, isInitiator) {
  * @param {string} type - 'reliable' or 'unreliable'
  */
 function setupDataChannel(playerId, channel, type) {
+  // Binary packets (packed inputs / state deltas) arrive as ArrayBuffer.
+  // Without this they arrive as Blob and JSON.parse throws on every packet.
+  channel.binaryType = 'arraybuffer';
   NetworkState.dataChannels.set(`${playerId}-${type}`, channel);
   
   channel.onopen = () => {
@@ -525,13 +528,13 @@ function handleDataChannelMessage(playerId, data, channelType) {
   switch (message.type) {
     case 'INPUT':
       if (NetworkState.isHost) {
-        handleInputPacket(playerId, message.data);
+        receiveClientInput(playerId, message.data);
       }
       break;
       
     case 'STATE_UPDATE':
       if (!NetworkState.isHost) {
-        handleStateUpdate(message.data);
+        receiveStateUpdate(message.data);
       }
       break;
       
