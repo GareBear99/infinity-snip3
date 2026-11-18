@@ -1,5 +1,17 @@
 # Wii Play Tanks — gap assessment for Infinity Snip3 main play
 
+## Status: gap closed for the main play (2026-11-17)
+
+Enemy tanks + types, levels, lives/score, and self-hit = death are now built
+(commit on top of ed02b90, tests/snip3-main-mode.test.js, 82 checks). The
+pie-slice arena was deliberately NOT changed to rectangular block walls
+(Gary 2026-11-17: the pie slices are the game's identity and they stay) —
+the Wii Tanks feel comes from the enemies, levels, lives/score, self-hit,
+and the ricochet, not from copying Wii Tanks' walls. Trail / dash / charge
+were KEPT (trail is visual only; dash and charge are player abilities).
+Mine-laying enemy type left out (no mine system; see the code comment).
+Details in the commit and the coordinator's report.
+
 Date: 2026-11-17. Design direction (Gary): "infinity snipe is supposed to be like
 the wii tank game in the main play" — Wii Play Tanks (Tanks! mini-game) is the
 reference for the main play.

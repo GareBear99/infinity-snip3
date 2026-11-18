@@ -555,7 +555,7 @@ function installAudioUnlockHooks(logFn){
   // ---------------------------
   // App modes: BOOT → MENU → GAME
   // ---------------------------
-  let appMode = 'BOOT_WAIT'; // BOOT_WAIT, BOOT, MENU, GAME, PAUSE, VICTORY
+  let appMode = 'BOOT_WAIT'; // BOOT_WAIT, BOOT, MENU, GAME, PAUSE, VICTORY, GAMEOVER
   let bootT0 = 0;
   const BOOT_MIN_DURATION_MS = 5200;
   let bootFlash = 0;
@@ -617,6 +617,10 @@ function installAudioUnlockHooks(logFn){
   let winnerId = -1;
   let victoryTimer = 0;
   let victoryEnterT0 = 0;
+
+  // SNIP3 game-over state (mirrors the VICTORY trio above)
+  let gameOverTimer = 0;
+  let gameOverEnterT0 = 0;
 
   // Lobby overlay (hold Tab or hold the rainbow button)
   let lobbyOverlayVisible = false;
@@ -691,6 +695,15 @@ function installAudioUnlockHooks(logFn){
     winnerId = -1;
     victoryTimer = 0;
     victoryEnterT0 = 0;
+    gameOverTimer = 0;
+    gameOverEnterT0 = 0;
+    // SNIP3 run state (score/lives live on players[0]; the level machine
+    // lives here so a fresh run always starts at level 1, fighting).
+    snip3Level = 1;
+    snip3State = 'fighting';
+    snip3StateT = 0;
+    snip3LevelT = 0;
+    snip3LastBonus = 0;
     tSec = 0;
     keys.clear();
     aimMode = 'mouse';
@@ -714,7 +727,8 @@ function installAudioUnlockHooks(logFn){
     setSeed(c.seed);      // seeds RNG *before* any generation
     initBarriers();       // one seeded barrier per slice
     initPlayers();        // exactly once, after seeding
-    resetP1Systems();     // lasers/sparks/charge/boost/cooldowns
+    resetP1Systems();     // lasers/sparks/charge/boost/cooldowns (+ SNIP3 enemies)
+    if (c.mode === 'SNIP3') initSnip3Run(); // score/lives reset + level 1 enemies
     syncPlayerCountSelect();
     appMode = 'GAME';     // flip mode LAST, after the world exists
     menuPage = 'MAIN';
@@ -1449,6 +1463,362 @@ window.addEventListener('keyup', (e) => {
   }
 
   // ---------------------------
+  // SNIP3 main play: enemy tanks, levels, lives, score (Wii Tanks gap)
+  // ---------------------------
+  // The arena stays the pie-slice arena (radial barriers, slice ring) — that
+  // is this game's identity and it does not change. The Wii Tanks feel comes
+  // from the enemy tanks, the levels, one-hit death + limited lives, the
+  // score, and your own ricochet being able to kill you — not from copying
+  // Wii Tanks' rectangular block walls.
+  //
+  // Enemy types (4 of Wii Tanks' 5 — the mine-layer is deliberately left out:
+  // there is no mine system in this game and it would be a second mechanic,
+  // not a tank variant; it can be added later on top of this table):
+  //   BASIC    — steady, one shot, 1 HP.
+  //   FAST     — quick, fires more often, 1 HP.
+  //   MULTI    — slow, fires a 3-shot spread, 1 HP.
+  //   ARMOURED — slow, 2 HP (takes two hits), 1 shot.
+  // Enemy lasers follow the exact same ricochet rules as player lasers
+  // (2 bounces, dies on the 3rd collision) and use the shared lasers array
+  // with a negative ownerId (player lasers are ownerId 0 in SNIP3; the
+  // 12-mini-laser spray owns -1, so enemy ids map to -2, -3, ...).
+  const enemies = [];
+  const SNIP3_START_LIVES = 3;
+  const ENEMY_TYPES = {
+    BASIC:    { speed: 150, hp: 1, fireInterval: 2.4, score: 100, shots: 1, color: {r:255,g:90,b:90},   radius: 16 },
+    FAST:     { speed: 260, hp: 1, fireInterval: 1.7, score: 150, shots: 1, color: {r:255,g:165,b:80},  radius: 14 },
+    MULTI:    { speed: 120, hp: 1, fireInterval: 3.0, score: 200, shots: 3, color: {r:255,g:90,b:230},  radius: 17 },
+    ARMOURED: { speed: 90,  hp: 2, fireInterval: 2.8, score: 300, shots: 1, color: {r:200,g:210,b:220}, radius: 19 },
+  };
+  const ENEMY_TYPE_KEYS = ['BASIC', 'FAST', 'MULTI', 'ARMOURED'];
+
+  // Level table: 10 hand-defined levels, then endless scaling (level 11+
+  // grows the composition instead of ending — the game never runs out of
+  // levels, it just keeps getting harder). Clear every enemy to advance;
+  // the clear bonus is 100 x the level number.
+  const SNIP3_LEVELS = [
+    { basic: 3 },
+    { basic: 4 },
+    { basic: 3, fast: 1 },
+    { basic: 4, fast: 2 },
+    { basic: 3, fast: 2, multi: 1 },
+    { basic: 4, fast: 2, multi: 2 },
+    { basic: 3, fast: 2, multi: 2, armoured: 1 },
+    { basic: 4, fast: 3, multi: 2, armoured: 1 },
+    { basic: 5, fast: 3, multi: 3, armoured: 2 },
+    { basic: 5, fast: 4, multi: 3, armoured: 2 },
+  ];
+  function snip3LevelComp(level){
+    if (level <= SNIP3_LEVELS.length) return SNIP3_LEVELS[level - 1];
+    const extra = level - SNIP3_LEVELS.length;
+    return {
+      basic: 5 + extra,
+      fast: 4 + Math.floor(extra / 2),
+      multi: 3 + Math.floor(extra / 2),
+      armoured: 2 + Math.floor(extra / 3),
+    };
+  }
+
+  // Level machine: 'fighting' (enemies alive) -> 'clear' (bonus, 1.6 s
+  // breather) -> next level; 'dead' (player down, 1.4 s) -> respawn and
+  // restart the SAME level (Wii Tanks restarts the level on death) while
+  // lives remain, otherwise the game is over.
+  let snip3Level = 1;
+  let snip3State = 'fighting';
+  let snip3StateT = 0;
+  let snip3LevelT = 0;   // time since the current level started (banner)
+  let snip3LastBonus = 0;
+  let snip3EnemySeq = 0;
+
+  function spawnEnemyTank(type, x, y){
+    const def = ENEMY_TYPES[type] || ENEMY_TYPES.BASIC;
+    const e = {
+      id: snip3EnemySeq++,
+      type,
+      def,
+      x, y,
+      vx: 0, vy: 0,
+      aimX: 1, aimY: 0,
+      hp: def.hp,
+      alive: true,
+      fireCooldown: def.fireInterval * randRange(0.6, 1.4),
+      spawnGrace: 0.8, // no firing in the first 0.8 s (no spawn-camping)
+      targetX: x, targetY: y,
+      retargetT: randRange(0, 1.0),
+    };
+    enemies.push(e);
+    return e;
+  }
+
+  function initSnip3Level(level){
+    enemies.length = 0;
+    snip3EnemySeq = 0;
+    const a = arena();
+    const p1 = players[0];
+    const comp = snip3LevelComp(level);
+    // Spawn order is fixed (basic, fast, multi, armoured) so the same seed
+    // reproduces the same level.
+    const queue = [];
+    for (const key of ['basic', 'fast', 'multi', 'armoured']) {
+      const n = comp[key] | 0;
+      for (let i = 0; i < n; i++) queue.push(key.toUpperCase());
+    }
+    for (const type of queue) {
+      let x = a.cx, y = a.cy - a.r * 0.6;
+      // Rejection-sample a spawn: inside the arena, away from the player,
+      // away from other enemies, clear of the radial barriers.
+      for (let k = 0; k < 40; k++) {
+        const ang = rand() * TAU;
+        const rr = a.r * randRange(0.45, 0.78);
+        const tx = a.cx + Math.cos(ang) * rr;
+        const ty = a.cy + Math.sin(ang) * rr;
+        if (p1 && Math.hypot(tx - p1.x, ty - p1.y) < a.r * 0.35) continue;
+        let ok = true;
+        for (const o of enemies) {
+          if (Math.hypot(tx - o.x, ty - o.y) < 70) { ok = false; break; }
+        }
+        if (!ok) continue;
+        for (const B of barriers) {
+          const cp = closestPointOnSeg(tx, ty, B.x0, B.y0, B.x1, B.y1);
+          if (Math.hypot(tx - cp.x, ty - cp.y) < 55) { ok = false; break; }
+        }
+        if (!ok) continue;
+        x = tx; y = ty;
+        break;
+      }
+      spawnEnemyTank(type, x, y);
+    }
+    snip3State = 'fighting';
+    snip3StateT = 0;
+    snip3LevelT = 0;
+    snip3LastBonus = 0;
+    log('INFO', `SNIP3: Level ${level} — ${enemies.length} enemies (${queue.join(',')})`);
+  }
+
+  // Fresh SNIP3 run: score and lives reset, level 1. Called from startGame()
+  // only (the single entry point), after initPlayers/resetP1Systems.
+  function initSnip3Run(){
+    const p1 = players[0];
+    if (p1) { p1.score = 0; p1.lives = SNIP3_START_LIVES; }
+    snip3Level = 1;
+    initSnip3Level(1);
+  }
+
+  function respawnPlayerSnip3(){
+    const p1 = players[0];
+    if (!p1) return;
+    // Restart the level from a fixed safe spot (bottom of the arena);
+    // initSnip3Level spawns the enemies away from this spot.
+    const a = arena();
+    resetP1Systems(); // clears lasers/sparks/charge/boost AND the old enemies
+    p1.x = a.cx;
+    p1.y = a.cy + a.r * 0.6;
+    p1.vx = 0; p1.vy = 0;
+    p1.alive = true;
+    p1.trail.length = 0;
+    p1.aimX = 0; p1.aimY = -1;
+  }
+
+  // One hit kills YOUR tank (Wii Tanks stakes). Death restarts the level
+  // while lives remain; at 0 lives the run ends on the GAMEOVER screen.
+  function killPlayerSnip3(cause, hx, hy){
+    const p1 = players[0];
+    if (!p1 || !p1.alive || gameMode !== 'SNIP3') return;
+    p1.alive = false;
+    p1.lives = Math.max(0, (p1.lives | 0) - 1);
+    if (cause === 'self') selfHitExplode(hx, hy); // explosion + zap + mini spray
+    else { playZapSfx(); spawnExplosion(hx, hy, 1.1); }
+    log('INFO', `SNIP3: P1 killed by ${cause}. Lives left: ${p1.lives}`);
+    snip3State = 'dead';
+    snip3StateT = 1.4;
+  }
+
+  function endSnip3GameOver(){
+    gameOverTimer = 0;
+    gameOverEnterT0 = performance.now();
+    appMode = 'GAMEOVER';
+    const p1 = players[0];
+    log('INFO', `SNIP3: GAME OVER — score ${p1 ? p1.score : 0}, reached level ${snip3Level}`);
+  }
+
+  function damageEnemy(e, dmg, hx, hy){
+    if (!e || !e.alive) return;
+    e.hp -= dmg;
+    if (e.hp > 0) { spawnBounceFlash(hx, hy); return; } // armoured chip: quiet glint
+    e.alive = false;
+    playZapSfx();
+    spawnExplosion(hx, hy, 0.9);
+    const p1 = players[0];
+    if (p1) p1.score = (p1.score | 0) + e.def.score;
+    log('INFO', `SNIP3: ${e.type} destroyed +${e.def.score} (score ${p1 ? p1.score : 0})`);
+  }
+
+  function enemyIdFromOwner(ownerId){
+    return -(ownerId | 0) - 2;
+  }
+
+  function spawnEnemyLaser(e, aimX, aimY){
+    const dx = aimX, dy = aimY;
+    const speed = 1250;
+    const head = 30;
+    const sx = e.x + dx * head;
+    const sy = e.y + dy * head;
+    lasers.push({
+      ownerId: -(e.id + 2),
+      x: sx, y: sy,
+      px: sx, py: sy,
+      vx: dx * speed, vy: dy * speed,
+      dirX: dx, dirY: dy,
+      life: 0,
+      maxLife: 0.6,
+      power: 0.15,
+      bouncesLeft: 2, // same ricochet rules as player lasers
+      safeTime: 0.15,
+    });
+  }
+
+  function enemyFire(e){
+    const shots = e.def.shots || 1;
+    const spread = 0.14;
+    const baseAng = Math.atan2(e.aimY, e.aimX);
+    for (let k = 0; k < shots; k++) {
+      const off = (shots === 1) ? 0 : (k - (shots - 1) / 2) * spread;
+      const a = baseAng + off + randRange(-0.06, 0.06); // aim error: fair, not perfect
+      spawnEnemyLaser(e, Math.cos(a), Math.sin(a));
+    }
+    playShootSfx();
+    e.fireCooldown = e.def.fireInterval * randRange(0.85, 1.2);
+  }
+
+  // Circle-vs-radial-barrier push-out, for tanks that are NOT slice-bound
+  // (enemies roam the whole arena; the player uses collidePlayerWithBarrier).
+  function collideCircleWithBarriers(o, radius){
+    if (!barriers.length) return;
+    for (const B of barriers) {
+      const cp = closestPointOnSeg(o.x, o.y, B.x0, B.y0, B.x1, B.y1);
+      const dx = o.x - cp.x;
+      const dy = o.y - cp.y;
+      const d2 = dx * dx + dy * dy;
+      if (d2 < radius * radius) {
+        const d = Math.sqrt(d2) || 1;
+        const nx = dx / d, ny = dy / d;
+        const push = (radius - d) + 0.6;
+        o.x += nx * push;
+        o.y += ny * push;
+        const vn = o.vx * nx + o.vy * ny;
+        if (vn < 0) { o.vx -= nx * vn * 1.85; o.vy -= ny * vn * 1.85; o.vx *= 0.92; o.vy *= 0.92; }
+      }
+    }
+  }
+
+  function updateEnemies(dt){
+    const p1 = players[0];
+    const a = arena();
+    for (const e of enemies) {
+      if (!e.alive) continue;
+      e.spawnGrace = Math.max(0, e.spawnGrace - dt);
+
+      // Pick a new destination every ~2-3 s: mostly stalk the player at a
+      // standoff distance, sometimes wander so the arena stays alive.
+      e.retargetT -= dt;
+      if (e.retargetT <= 0) {
+        e.retargetT = 1.6 + rand() * 1.6;
+        if (p1 && p1.alive && rand() < 0.65) {
+          const ang = Math.atan2(p1.y - e.y, p1.x - e.x) + randRange(-0.9, 0.9);
+          const dist = a.r * randRange(0.25, 0.45);
+          e.targetX = p1.x + Math.cos(ang) * dist;
+          e.targetY = p1.y + Math.sin(ang) * dist;
+        } else {
+          const ang = rand() * TAU;
+          const rr = a.r * randRange(0.2, 0.75);
+          e.targetX = a.cx + Math.cos(ang) * rr;
+          e.targetY = a.cy + Math.sin(ang) * rr;
+        }
+      }
+
+      // Steer toward the destination.
+      const dx = e.targetX - e.x, dy = e.targetY - e.y;
+      const n = norm(dx, dy);
+      const sp = e.def.speed;
+      const k = Math.min(1, 6 * dt);
+      e.vx += (n.x * sp - e.vx) * k;
+      e.vy += (n.y * sp - e.vy) * k;
+      e.x += e.vx * dt;
+      e.y += e.vy * dt;
+
+      // Stay inside the arena ring.
+      const ox = e.x - a.cx, oy = e.y - a.cy;
+      const rr = Math.hypot(ox, oy);
+      if (rr > a.r - 18) { e.x = a.cx + ox / rr * (a.r - 18); e.y = a.cy + oy / rr * (a.r - 18); }
+
+      collideCircleWithBarriers(e, e.def.radius);
+
+      // Separation: enemies don't stack on each other.
+      for (const o of enemies) {
+        if (o === e || !o.alive) continue;
+        const sx = e.x - o.x, sy = e.y - o.y;
+        const d2 = sx * sx + sy * sy;
+        const min = e.def.radius + o.def.radius + 4;
+        if (d2 < min * min && d2 > 1e-6) {
+          const d = Math.sqrt(d2);
+          const push = (min - d) * 0.5;
+          e.x += sx / d * push;
+          e.y += sy / d * push;
+        }
+      }
+
+      // Aim at the player; fire on the type's interval.
+      if (p1 && p1.alive) {
+        const an = norm(p1.x - e.x, p1.y - e.y);
+        e.aimX = an.x; e.aimY = an.y;
+      }
+      e.fireCooldown -= dt;
+      if (e.fireCooldown <= 0 && e.spawnGrace <= 0 && p1 && p1.alive && snip3State === 'fighting') {
+        enemyFire(e);
+      }
+    }
+    // Sweep the dead (damageEnemy only marks them; the sweep keeps the
+    // laser loop from iterating corpses mid-step).
+    for (let i = enemies.length - 1; i >= 0; i--) {
+      if (!enemies[i].alive) enemies.splice(i, 1);
+    }
+  }
+
+  // Level machine tick (called from step(), GAME mode only).
+  function updateSnip3(dt){
+    snip3LevelT += dt;
+    if (snip3State === 'dead') {
+      snip3StateT -= dt;
+      if (snip3StateT <= 0) {
+        const p1 = players[0];
+        if (p1 && p1.lives > 0) {
+          respawnPlayerSnip3();
+          initSnip3Level(snip3Level); // death restarts the SAME level
+        } else {
+          endSnip3GameOver();
+        }
+      }
+    } else if (snip3State === 'clear') {
+      snip3StateT -= dt;
+      if (snip3StateT <= 0) {
+        snip3Level++;
+        initSnip3Level(snip3Level);
+      }
+    } else if (snip3State === 'fighting') {
+      if (enemies.length === 0) {
+        const bonus = 100 * snip3Level;
+        const p1 = players[0];
+        if (p1) p1.score = (p1.score | 0) + bonus;
+        snip3LastBonus = bonus;
+        snip3State = 'clear';
+        snip3StateT = 1.6;
+        log('INFO', `SNIP3: Level ${snip3Level} clear! Bonus +${bonus}`);
+      }
+    }
+    updateEnemies(dt);
+  }
+
+  // ---------------------------
   // Neon drawing primitives
   // ---------------------------
   function neonLine(x0,y0,x1,y1, coreW, haloW, coreA, haloA, color){
@@ -2173,7 +2543,6 @@ function startMenuMusic(){
     spawnExplosion(x,y,0.9);
     spawnMiniLasers(x,y);
   }
-  function triggerSelfHit(x,y){ selfHitExplode(x,y); }
 
   function eliminatePlayer(p, x, y, byId){
     if (!p || !p.alive) return;
@@ -2185,7 +2554,9 @@ function startMenuMusic(){
     if (gameMode === 'VS') {
       const alive = players.filter(pp => pp.alive);
       if (alive.length <= 1) {
-        const w = alive.length ? alive[0].id : byId;
+        // winnerId is a 0-based index (the victory screen shows
+        // PLAYER ${winnerId+1}); p.id is 1-based, byId is already 0-based.
+        const w = alive.length ? alive[0].id - 1 : byId;
         endVsRound((w == null || w < 0) ? 0 : w);
       }
     }
@@ -2754,14 +3125,6 @@ function startMenuMusic(){
     victoryEnterT0 = performance.now();
     appMode = 'VICTORY';
     log('INFO', `VS: Winner P${winnerId+1}`);
-  }
-
-  function eliminatePlayer(pid, hx, hy){
-    const p = players[pid];
-    if (!p || !p.alive) return;
-    p.alive = false;
-    playZapSfx();
-    spawnExplosion(hx, hy, 0.95);
   }
 
   function sampleGamepadForPlayer(playerIndex, padIndex){
@@ -3662,7 +4025,10 @@ function drawMenuScreen(now){
 
     const winLabel = (winnerId >= 0) ? `PLAYER ${winnerId+1} WINS` : 'WINNER';
     const c = colorForIndex((winnerId>=0)?winnerId:0);
-    neonText(winLabel, a.cx, a.cy*0.55, Math.floor(fs*0.62), c, 0.95, 0.20);
+    // drawTubeText is the tube-lettering primitive (the old neonText call
+    // referenced a function that never existed, so the victory screen threw
+    // a ReferenceError on its first frame).
+    drawTubeText(winLabel, a.cx, a.cy*0.55, Math.floor(fs*0.62), `rgba(${c.r},${c.g},${c.b},ALPHA)`, 0.95 + 0.20*pulse, 0.16);
 
     ctx.font = `600 ${Math.floor(fs*0.28)}px system-ui, -apple-system, Segoe UI, Roboto, Arial`;
     ctx.fillStyle = 'rgba(255,255,255,0.30)';
@@ -3674,6 +4040,113 @@ function drawMenuScreen(now){
     ctx.fillText('PRESS ANYTHING TO RETURN', a.cx, canvas.height - fs*0.25);
 
     applyBrightnessPass();
+  }
+
+  function drawGameOverScreen(now){
+    const a = arena();
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0,0,canvas.width, canvas.height);
+
+    const t = now * 0.001;
+    const pulse = 0.10 + 0.08*Math.sin(t*3.0);
+
+    const grd = ctx.createRadialGradient(a.cx, a.cy, a.r*0.05, a.cx, a.cy, a.r*1.25);
+    grd.addColorStop(0, 'rgba(95,0,0,0.40)');
+    grd.addColorStop(1, 'rgba(0,0,0,0.99)');
+    ctx.fillStyle = grd;
+    ctx.fillRect(0,0,canvas.width, canvas.height);
+
+    const fs = Math.floor(Math.min(canvas.width, canvas.height) * 0.10);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+
+    drawTubeText('GAME OVER', a.cx, a.cy*0.40, Math.floor(fs*0.70), 'rgba(255,90,90,ALPHA)', 0.80 + 0.20*pulse, 0.16);
+
+    const p1 = players[0];
+    const score = p1 ? (p1.score | 0) : 0;
+    ctx.font = `600 ${Math.floor(fs*0.34)}px system-ui, -apple-system, Segoe UI, Roboto, Arial`;
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.fillText(`SCORE ${String(score).padStart(6, '0')}   LEVEL ${snip3Level}`, a.cx, a.cy*0.58);
+
+    ctx.font = `600 ${Math.floor(fs*0.28)}px system-ui, -apple-system, Segoe UI, Roboto, Arial`;
+    ctx.fillStyle = 'rgba(255,255,255,0.30)';
+    ctx.fillText('Out of lives.', a.cx, a.cy*0.68);
+
+    ctx.textBaseline = 'bottom';
+    ctx.font = `600 ${Math.floor(fs*0.24)}px system-ui, -apple-system, Segoe UI, Roboto, Arial`;
+    ctx.fillStyle = 'rgba(255,255,255,0.25)';
+    ctx.fillText('PRESS ANYTHING TO RETURN', a.cx, canvas.height - fs*0.25);
+
+    applyBrightnessPass();
+  }
+
+  // ---------------------------
+  // SNIP3 draw: enemy tanks + HUD (score / level / lives)
+  // ---------------------------
+  function drawEnemyTank(e){
+    const c = e.def.color;
+    const ang = Math.atan2(e.aimY, e.aimX);
+    const fx = Math.cos(ang), fy = Math.sin(ang);
+    // Barrel
+    neonLine(e.x, e.y, e.x + fx * 26, e.y + fy * 26, 2.0, 8.0, 0.80, 0.15, c);
+    // Body: outer ring + inner core (same neon idiom as the player ship).
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.beginPath();
+    ctx.arc(e.x, e.y, e.def.radius, 0, Math.PI * 2);
+    ctx.strokeStyle = `rgba(${c.r},${c.g},${c.b},0.65)`;
+    ctx.lineWidth = 2.2;
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(e.x, e.y, e.def.radius * 0.55, 0, Math.PI * 2);
+    ctx.strokeStyle = `rgba(${c.r},${c.g},${c.b},0.30)`;
+    ctx.lineWidth = 6;
+    ctx.stroke();
+    // Armoured tanks show a second ring while they still have 2 HP, so the
+    // player can tell at a glance that one hit won't kill them.
+    if (e.type === 'ARMOURED' && e.hp > 1) {
+      ctx.beginPath();
+      ctx.arc(e.x, e.y, e.def.radius + 5, 0, Math.PI * 2);
+      ctx.strokeStyle = `rgba(${c.r},${c.g},${c.b},0.35)`;
+      ctx.lineWidth = 1.6;
+      ctx.stroke();
+    }
+  }
+
+  function drawEnemies(){
+    for (const e of enemies) {
+      if (e.alive) drawEnemyTank(e);
+    }
+  }
+
+  function drawSnip3Hud(){
+    if (gameMode !== 'SNIP3') return;
+    const p1 = players[0];
+    if (!p1) return;
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'top';
+    const px = Math.floor(Math.min(canvas.width, canvas.height) * 0.020);
+    ctx.font = `600 ${px}px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace`;
+    ctx.fillStyle = 'rgba(255,255,255,0.75)';
+    ctx.fillText(`SCORE ${String(p1.score | 0).padStart(6, '0')}   LEVEL ${snip3Level}   LIVES ${Math.max(0, p1.lives | 0)}`, canvas.width / 2, 12);
+
+    // Centre banners: level intro, level clear, tank down.
+    const a = arena();
+    ctx.textBaseline = 'middle';
+    if (snip3State === 'clear') {
+      ctx.font = `700 ${Math.floor(px * 1.6)}px system-ui, -apple-system, Segoe UI, Roboto, Arial`;
+      ctx.fillStyle = 'rgba(120,255,140,0.90)';
+      ctx.fillText(`LEVEL CLEAR!  BONUS +${snip3LastBonus}`, a.cx, a.cy * 0.42);
+    } else if (snip3State === 'dead') {
+      ctx.font = `700 ${Math.floor(px * 1.6)}px system-ui, -apple-system, Segoe UI, Roboto, Arial`;
+      ctx.fillStyle = 'rgba(255,90,90,0.90)';
+      ctx.fillText('TANK DOWN!', a.cx, a.cy * 0.42);
+    } else if (snip3LevelT < 1.2) {
+      ctx.font = `700 ${Math.floor(px * 1.6)}px system-ui, -apple-system, Segoe UI, Roboto, Arial`;
+      ctx.fillStyle = 'rgba(255,255,255,0.85)';
+      ctx.fillText(`LEVEL ${snip3Level}`, a.cx, a.cy * 0.42);
+    }
   }
 
 
@@ -3777,6 +4250,14 @@ function drawMenuScreen(now){
     boostWindowLeft = 0;
     boostWindowT = 0;
     boostSecondUsed = false;
+
+    // SNIP3: no enemy may survive a reset (start / quit / respawn all funnel
+    // through here). The level machine resets to 'fighting'; the level
+    // number itself is run state and is reset by resetRoundState/initSnip3Run.
+    enemies.length = 0;
+    snip3State = 'fighting';
+    snip3StateT = 0;
+    snip3LevelT = 0;
   }
 
   function setPlayerCount(n){
@@ -3823,6 +4304,10 @@ function drawMenuScreen(now){
 
     const p1 = players[0];
 
+    // A dead SNIP3 tank can't charge or fire (VS is untouched: in VS a dead
+    // player's inputs were never gated here, and this stays that way).
+    const p1CanAct = (gameMode !== 'SNIP3') || (p1 && p1.alive);
+
     // Arrow-aim override (press left/right) until the mouse moves again.
     if (mouseMoved) {
       aimMode = 'mouse';
@@ -3866,9 +4351,17 @@ function drawMenuScreen(now){
     // Combined hold input for charging (either Space, or ArrowUp after hold threshold)
     const chargeHeldInput = spaceHeld || (arrowUpHeld && arrowUpHoldCharging);
 
+    // Dying mid-charge cancels the charge (no shot from a corpse).
+    if (!p1CanAct && charging) {
+      charging = false;
+      charge = 0;
+      chargeHeld = 0;
+      chargeFullBlink = 0;
+    }
+
     if (!chargeHeldInput && chargeLockUntilRelease) chargeLockUntilRelease = false;
 
-    if (chargeHeldInput && !charging && !chargeLockUntilRelease) {
+    if (chargeHeldInput && !charging && !chargeLockUntilRelease && p1CanAct) {
       charging = true;
       chargeHeld = 0;
       chargeFullBlink = 0;
@@ -3895,7 +4388,7 @@ function drawMenuScreen(now){
 
     // ArrowUp tap = click shot (only if we did NOT enter hold-to-charge)
     // (We do this on release so a quick tap fires once.)
-    if (arrowUpReleased && !arrowUpHoldCharging && !charging) {
+    if (arrowUpReleased && !arrowUpHoldCharging && !charging && p1CanAct) {
       if (shootCooldown <= 0) {
         spawnLaserFromP1(0.15);
         shootCooldown = LASER_COOLDOWN;
@@ -3919,7 +4412,7 @@ function drawMenuScreen(now){
     shootCooldown = Math.max(0, shootCooldown - dt);
     const mousePressed = mouseDown && !prevMouseDown;
     const gpPressed = p1Input.gpFire && !prevP1GpFire;
-    if (!charging && (mousePressed || gpPressed) && shootCooldown <= 0) {
+    if (!charging && (mousePressed || gpPressed) && shootCooldown <= 0 && p1CanAct) {
       spawnLaserFromP1(0.15);
       shootCooldown = LASER_COOLDOWN;
     }
@@ -3933,6 +4426,11 @@ function drawMenuScreen(now){
     // --- Update each player ---
     for (let i=0;i<players.length;i++){
       const p = players[i];
+
+      // A dead SNIP3 tank doesn't move, drift, or leave a trail while it
+      // waits for the respawn / game-over timer (VS dead players keep the
+      // old drift behaviour — untouched).
+      if (gameMode === 'SNIP3' && !p.alive) continue;
 
       // Inputs
       let move = {x:0,y:0,mag:0};
@@ -4083,6 +4581,9 @@ function drawMenuScreen(now){
       if (p.trail.length > p.trailMax) p.trail.shift();
     }
 
+    // SNIP3: enemies, level machine, death/respawn timers.
+    if (gameMode === 'SNIP3') updateSnip3(dt);
+
     // Lasers update + ricochet off screen edges
     const minX = LASER_RADIUS;
     const maxX = canvas.width  - LASER_RADIUS;
@@ -4163,7 +4664,10 @@ function drawMenuScreen(now){
           for (const p of players) {
             if (!p.alive) continue;
             // Self-hit only after first bounce, just like SNIP3.
-            if (p.id === (L.ownerId ?? -999) && ((L.bouncesLeft|0) >= 2)) continue;
+            // (p.id is 1-based, L.ownerId is 0-based — compare accordingly;
+            // the old comparison never matched, so a fresh laser could hit
+            // its owner the moment safeTime expired.)
+            if ((p.id - 1) === (L.ownerId ?? -999) && ((L.bouncesLeft|0) >= 2)) continue;
             const tHit = intersectSegmentCircle(L.px, L.py, L.x, L.y, p.x, p.y, PLAYER_HIT_R);
             if (tHit !== null) {
               const hx = L.px + (L.x - L.px) * tHit;
@@ -4176,15 +4680,69 @@ function drawMenuScreen(now){
           }
           if (removed) continue;
         } else {
-          // SNIP3: only P1 self-hit after at least one bounce.
-          if (((L.bouncesLeft|0) < 2)) {
-            const tHit = intersectSegmentCircle(L.px, L.py, L.x, L.y, players[0].x, players[0].y, PLAYER_HIT_R);
-            if (tHit !== null) {
-              const hx = L.px + (L.x - L.px) * tHit;
-              const hy = L.py + (L.y - L.py) * tHit;
-              triggerSelfHit(hx, hy);
-              lasers.splice(i, 1);
-              continue;
+          // SNIP3: player lasers vs enemies, enemy lasers vs the player
+          // (one hit kills — Wii Tanks stakes), and your own ricochet
+          // kills you after at least one bounce. Enemy lasers use a
+          // negative ownerId (-2, -3, ...); player lasers are ownerId 0.
+          const isEnemyLaser = ((L.ownerId ?? 0) < -1);
+          if (isEnemyLaser) {
+            // Enemy laser vs the player.
+            if (players[0].alive) {
+              const tHit = intersectSegmentCircle(L.px, L.py, L.x, L.y, players[0].x, players[0].y, PLAYER_HIT_R);
+              if (tHit !== null) {
+                const hx = L.px + (L.x - L.px) * tHit;
+                const hy = L.py + (L.y - L.py) * tHit;
+                killPlayerSnip3('enemy', hx, hy);
+                lasers.splice(i, 1);
+                continue;
+              }
+            }
+            // Enemy laser vs other enemies (banked friendly fire, Wii Tanks-style).
+            // The enemy that fired it is immune until the laser has bounced,
+            // the same rule players get for their own shots.
+            let removed = false;
+            for (const e of enemies) {
+              if (!e.alive) continue;
+              if (e.id === enemyIdFromOwner(L.ownerId) && ((L.bouncesLeft|0) >= 2)) continue;
+              const tHit = intersectSegmentCircle(L.px, L.py, L.x, L.y, e.x, e.y, e.def.radius);
+              if (tHit !== null) {
+                const hx = L.px + (L.x - L.px) * tHit;
+                const hy = L.py + (L.y - L.py) * tHit;
+                damageEnemy(e, 1, hx, hy);
+                lasers.splice(i, 1);
+                removed = true;
+                break;
+              }
+            }
+            if (removed) continue;
+          } else {
+            // Player laser vs enemies.
+            let removed = false;
+            for (const e of enemies) {
+              if (!e.alive) continue;
+              const tHit = intersectSegmentCircle(L.px, L.py, L.x, L.y, e.x, e.y, e.def.radius);
+              if (tHit !== null) {
+                const hx = L.px + (L.x - L.px) * tHit;
+                const hy = L.py + (L.y - L.py) * tHit;
+                damageEnemy(e, 1, hx, hy);
+                lasers.splice(i, 1);
+                removed = true;
+                break;
+              }
+            }
+            if (removed) continue;
+            // Self-hit: your own ricochet kills you (Wii Tanks). Only after
+            // at least one bounce (bouncesLeft drops below its start of 2) —
+            // the fresh shot leaving your barrel can't kill you.
+            if (players[0].alive && ((L.bouncesLeft|0) < 2)) {
+              const tHit = intersectSegmentCircle(L.px, L.py, L.x, L.y, players[0].x, players[0].y, PLAYER_HIT_R);
+              if (tHit !== null) {
+                const hx = L.px + (L.x - L.px) * tHit;
+                const hy = L.py + (L.y - L.py) * tHit;
+                killPlayerSnip3('self', hx, hy);
+                lasers.splice(i, 1);
+                continue;
+              }
             }
           }
         }
@@ -4397,6 +4955,23 @@ if (!gcLocked && mouseDown && !menuClickDown && rainbowBtnRect && rainbowBtnRect
       return;
     }
 
+    if (appMode === 'GAMEOVER') {
+      gameOverTimer = (now - gameOverEnterT0) * 0.001;
+      // Same exit path as VICTORY: press anything (debounced) -> menu.
+      const pads = getConnectedGamepads();
+      const gpAny = pads.some(p => p.pad.buttons && p.pad.buttons.some(b => b && b.pressed));
+      const keyAny = keys.size > 0;
+      const mouseAny = mouseDown;
+      if (gameOverTimer > 0.25 && (gpAny || keyAny || mouseAny)) {
+        goMenu();
+        playMenuSwitchSfx();
+        startMenuMusic();
+      }
+      drawGameOverScreen(now);
+      requestAnimationFrame(frameLoop);
+      return;
+    }
+
 
     if (appMode === 'PAUSE') {
       // Pause navigation (does not advance simulation)
@@ -4450,6 +5025,7 @@ if (!gcLocked && mouseDown && !menuClickDown && rainbowBtnRect && rainbowBtnRect
       }
 
       for (const p of players) drawPlayerTrail(p);
+      drawEnemies();
       drawLasers();
       drawSparks();
       for (let i=0;i<players.length;i++) drawPlayerShip(players[i], i===0);
@@ -4519,6 +5095,7 @@ if (!gcLocked && mouseDown && !menuClickDown && rainbowBtnRect && rainbowBtnRect
     }
 
     for (const p of players) drawPlayerTrail(p);
+    drawEnemies();
 
     drawLasers();
     drawSparks();
@@ -4530,6 +5107,7 @@ if (!gcLocked && mouseDown && !menuClickDown && rainbowBtnRect && rainbowBtnRect
 
     drawTouchSticks();
     drawLobbyOverlay(); // NEW: Draw lobby overlay if visible
+    drawSnip3Hud(); // SCORE / LEVEL / LIVES + level banners (SNIP3 only)
 
     applyBrightnessPass();
 
@@ -4904,7 +5482,7 @@ Examples:
         if (typeof ctx === 'undefined') errors.push('ctx undefined');
         
         // Check game mode is valid
-        if (!['BOOT_WAIT', 'BOOT', 'MENU', 'GAME', 'PAUSE', 'VICTORY'].includes(appMode)) {
+        if (!['BOOT_WAIT', 'BOOT', 'MENU', 'GAME', 'PAUSE', 'VICTORY', 'GAMEOVER'].includes(appMode)) {
           errors.push(`Invalid appMode: ${appMode}`);
         }
         
