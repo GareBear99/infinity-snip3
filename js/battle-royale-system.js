@@ -32,12 +32,15 @@ const BattleRoyale = {
   eliminatedPlayers: [],       // Array of {id, placement, time}
   placement: 1,                // Current placement (99, 98, 97...)
   
-  // Arena shrinking
+  // Arena shrinking — the pie circle starts MASSIVE (99 slices, one per
+  // player) and creeps smaller as players die. Deaths set the target;
+  // the count only steps down one slice per interval, so the circle
+  // changes SLOWLY and visibly instead of jumping.
   shrinkEnabled: true,
   currentSlices: 99,           // Current number of pie slices
   targetSlices: 99,            // Target after next shrink
-  shrinkProgress: 0,           // 0 to 1
-  shrinkSpeed: 0.3,            // Speed of shrink animation
+  shrinkProgress: 0,           // 0 to 1 within the current step interval
+  shrinkStepInterval: 2.0,     // Seconds per slice step (the "slowly" pacing)
   
   // Audio reactivity
   audioEnergy: 0,
@@ -49,8 +52,7 @@ const BattleRoyale = {
   // Game state
   gameMode: 'WARMUP',          // 'WARMUP', 'ACTIVE', 'ENDGAME', 'FINISHED'
   warmupTime: 5,               // Seconds before game starts
-  shrinkTimer: 30,             // Seconds between shrinks
-  timeSinceLastShrink: 0,
+  timeSinceLastShrink: 0,      // Seconds since the last slice step
   
   // Visual effects
   wallGlowPulse: 0,
@@ -285,18 +287,27 @@ function eliminatePlayer(player) {
 
 /**
  * Update arena shrinking animation
+ * The pie circle changes SLOWLY: deaths set targetSlices, but the slice
+ * count only steps down one slice per interval, so the circle visibly
+ * creeps inward instead of jumping to the target all at once.
+ * (Before: a ~3.3s timer, then a jump straight to the target.)
  * @param {number} dt - Delta time
+ * @param {Array} [players] - Players (slice boundaries are redistributed on each step)
  */
-function updateArenaShrink(dt) {
-  // Shrink animation
-  if (BattleRoyale.currentSlices > BattleRoyale.targetSlices) {
-    BattleRoyale.shrinkProgress += BattleRoyale.shrinkSpeed * dt;
-    
-    if (BattleRoyale.shrinkProgress >= 1.0) {
-      BattleRoyale.shrinkProgress = 0;
-      BattleRoyale.currentSlices = BattleRoyale.targetSlices;
-      console.log(`[BattleRoyale] Arena shrunk to ${BattleRoyale.currentSlices} slices`);
-    }
+function updateArenaShrink(dt, players) {
+  if (BattleRoyale.currentSlices <= BattleRoyale.targetSlices) {
+    BattleRoyale.shrinkProgress = 0;
+    BattleRoyale.timeSinceLastShrink = 0;
+    return;
+  }
+  BattleRoyale.timeSinceLastShrink += dt;
+  BattleRoyale.shrinkProgress = Math.min(1, BattleRoyale.timeSinceLastShrink / BattleRoyale.shrinkStepInterval);
+  if (BattleRoyale.timeSinceLastShrink >= BattleRoyale.shrinkStepInterval) {
+    BattleRoyale.timeSinceLastShrink = 0;
+    BattleRoyale.shrinkProgress = 0;
+    BattleRoyale.currentSlices -= 1;
+    if (players) recalculateSlices(players, BattleRoyale.currentSlices);
+    console.log(`[BattleRoyale] Arena shrunk to ${BattleRoyale.currentSlices} slices`);
   }
 }
 

@@ -385,6 +385,113 @@ function installAudioUnlockHooks(logFn){
     } catch {}
   }
 
+  // ---------------------------
+  // NEO-VECTR Game Center — local arcade profile sign-in
+  // ---------------------------
+  // Standalone local profiles (no server, no online account backend).
+  // A full online version would need a server + accounts + auth; the local
+  // profile is the arcade identity the online features (ONLINE VS, lobby)
+  // would attach to once they exist.
+  const LS_GAMECENTER = 'NEO-VECTR_gamecenter_v1';
+  let gameCenter = { profiles: [], active: null }; // profiles: [{name, createdAt, lastSeen}]
+  let gameCenterOpen = false;
+
+  function loadGameCenter(){
+    try {
+      const raw = STORE.get(LS_GAMECENTER);
+      if (!raw) return;
+      const obj = JSON.parse(raw);
+      if (!obj || typeof obj !== 'object') return;
+      if (Array.isArray(obj.profiles)) {
+        gameCenter.profiles = obj.profiles
+          .filter(p => p && typeof p.name === 'string' && p.name.trim())
+          .map(p => ({ name: String(p.name).trim().slice(0, 24), createdAt: p.createdAt || 0, lastSeen: p.lastSeen || 0 }));
+      }
+      if (typeof obj.active === 'string') {
+        const found = gameCenter.profiles.find(p => p.name === obj.active);
+        if (found) gameCenter.active = found.name;
+      }
+    } catch {}
+  }
+  function saveGameCenter(){
+    try { STORE.set(LS_GAMECENTER, JSON.stringify(gameCenter)); } catch {}
+  }
+  function gameCenterActiveName(){ return gameCenter.active; }
+  function gameCenterSignIn(name){
+    name = String(name || '').trim().slice(0, 24);
+    if (!name) return null;
+    let p = gameCenter.profiles.find(x => x.name.toLowerCase() === name.toLowerCase());
+    if (!p) {
+      p = { name, createdAt: Date.now(), lastSeen: Date.now() };
+      gameCenter.profiles.push(p);
+    } else {
+      p.lastSeen = Date.now();
+    }
+    gameCenter.active = p.name;
+    saveGameCenter();
+    log('INFO', `Game Center: signed in as ${p.name}`);
+    return p.name;
+  }
+  function gameCenterSignOut(){
+    gameCenter.active = null;
+    saveGameCenter();
+    log('INFO', 'Game Center: signed out');
+  }
+  function gameCenterDeleteProfile(name){
+    name = String(name || '').trim();
+    gameCenter.profiles = gameCenter.profiles.filter(p => p.name !== name);
+    if (gameCenter.active === name) gameCenter.active = null;
+    saveGameCenter();
+    log('INFO', `Game Center: deleted profile ${name}`);
+  }
+  function openGameCenter(){
+    gameCenterOpen = true;
+    renderGameCenterPanel();
+    const ov = document.getElementById('gameCenterOverlay');
+    if (ov) ov.style.display = 'flex';
+    const input = document.getElementById('gameCenterName');
+    if (input && input.focus) { try { input.focus(); } catch {} }
+    log('INFO', 'Game Center: opened');
+  }
+  function closeGameCenter(){
+    gameCenterOpen = false;
+    const ov = document.getElementById('gameCenterOverlay');
+    if (ov) ov.style.display = 'none';
+    keys.clear(); // drop any keys typed into the panel so they can't leak into the menu
+    log('INFO', 'Game Center: closed');
+  }
+  function renderGameCenterPanel(){
+    const status = document.getElementById('gameCenterStatus');
+    const list = document.getElementById('gameCenterProfiles');
+    const signOutBtn = document.getElementById('gameCenterSignOutBtn');
+    if (status) {
+      status.textContent = gameCenter.active
+        ? ('Signed in as ' + gameCenter.active)
+        : 'Not signed in — enter an arcade name to sign in.';
+    }
+    if (signOutBtn) signOutBtn.style.display = gameCenter.active ? '' : 'none';
+    if (list) {
+      list.innerHTML = '';
+      if (!gameCenter.profiles.length) {
+        list.textContent = 'No saved arcade profiles yet.';
+      } else {
+        for (const p of gameCenter.profiles) {
+          const row = document.createElement('div');
+          const btn = document.createElement('button');
+          btn.textContent = p.name + (p.name === gameCenter.active ? '  ✓' : '');
+          btn.addEventListener('click', () => { gameCenterSignIn(p.name); renderGameCenterPanel(); });
+          row.appendChild(btn);
+          const del = document.createElement('button');
+          del.textContent = '✕';
+          del.title = 'Delete profile';
+          del.addEventListener('click', () => { gameCenterDeleteProfile(p.name); renderGameCenterPanel(); });
+          row.appendChild(del);
+          list.appendChild(row);
+        }
+      }
+    }
+  }
+
 
   document.getElementById('dlLog').addEventListener('click', () => {
     let meta = {};
@@ -452,6 +559,7 @@ function installAudioUnlockHooks(logFn){
   let bootT0 = 0;
   const BOOT_MIN_DURATION_MS = 5200;
   let bootFlash = 0;
+  let bootSignHold = 0; // peak-hold for the audio-driven neon sign turn-on (Moses cannon)
   let menuSel = 0;
   let prevMenuSel = 0;
   let menuClickDown = false;
@@ -471,6 +579,7 @@ function installAudioUnlockHooks(logFn){
 
   // Initialize persisted settings (must occur after settings + setDebugVisible exist)
   loadSettings();
+  loadGameCenter();
   // Force debug HUD hidden on every boot (never start with debug visible)
   settings.debugOnMenu = false;
   settings.debugHudVisible = false;
@@ -1009,6 +1118,8 @@ window.addEventListener('keyup', (e) => {
 
   window.addEventListener('mousedown', (e) => {
     if (e.button === 0) {
+      // Clicks inside the Game Center panel are the panel's, not the game's.
+      if (e.target && e.target.closest && e.target.closest('#gameCenterOverlay')) return;
       mouseDown = true;
       if (appMode === 'MENU' && menuPage === 'SETTINGS') {
         settingsDrag = true;
@@ -1021,21 +1132,6 @@ window.addEventListener('keyup', (e) => {
     if (e.button === 0) {
       mouseDown = false;
       settingsDrag = false;
-
-      // Release rainbow hold → hide lobby list. If it was a short click, fire burst.
-      if (lobbyHoldSource === 'button') {
-        const heldMs = performance.now() - (rainbowHoldT0 || performance.now());
-        lobbyHoldActive = false;
-        lobbyHoldSource = '';
-        hideLobbyOverlay();
-        if (heldMs < 220) {
-          playMenuSelectSfx();
-          triggerEnergyBurst();
-          log('INFO', 'Rainbow burst (click)');
-        } else {
-          log('INFO', 'Lobby list: RELEASE (button)');
-        }
-      }
     }
   });
   window.addEventListener('blur', () => { mouseDown = false; keys.clear(); });
@@ -1750,6 +1846,8 @@ function startMenuMusic(){
   let _menuSfxLastT = 0;
   const _MENU_SFX_DEBOUNCE_MS = 55;
   let _ricIdx = 0;
+  let _ricSfxLastT = 0; // throttle so many lasers bouncing at once don't machine-gun the sound
+  const _RICOCHET_SFX_MIN_GAP_MS = 120;
   let _shootIdx = 0;
   let _boostIdx = 0;
   let _zapIdx = 0;
@@ -1821,6 +1919,7 @@ function startMenuMusic(){
     appMode = 'BOOT';
     bootT0 = performance.now();
     bootFlash = 0;
+    bootSignHold = 0;
 
     try {
       if (!bootAudioEl) {
@@ -1907,15 +2006,22 @@ function startMenuMusic(){
     return false;
   }
 
-  function playRicochetSfx(){
+  function playRicochetSfx(soft){
     if (!_audioUnlocked || !settings.sfxLaserRicochet) return; // Check setting
+    // Throttle: several lasers can bounce on the same frame; don't stack the
+    // sound on every single one.
+    const now = performance.now();
+    if (now - _ricSfxLastT < _RICOCHET_SFX_MIN_GAP_MS) return;
+    _ricSfxLastT = now;
     initSfxPools();
     const a = _ricPool[_ricIdx++ % _ricPool.length];
-    try { 
-      a.volume = Math.max(0, Math.min(1, 0.60 * (settings.sfxVol || 0.85))); // Apply master SFX vol
-      a.pause(); 
-      a.currentTime = 0; 
-      a.play().catch(()=>{}); 
+    try {
+      // Bounces are quiet ticks now (soft), not full-volume bangs.
+      const vol = soft ? 0.25 : 0.60;
+      a.volume = Math.max(0, Math.min(1, vol * (settings.sfxVol || 0.85))); // Apply master SFX vol
+      a.pause();
+      a.currentTime = 0;
+      a.play().catch(()=>{});
     } catch {}
   }
   function playShootSfx(){
@@ -2007,6 +2113,30 @@ function startMenuMusic(){
         g: 140 + Math.floor(90*Math.random()),
         b: 60 + Math.floor(30*Math.random()),
         size: 1.4 + 2.4*Math.random() + 1.8*power,
+      });
+    }
+    if (sparks.length > SPARK_MAX) sparks.splice(0, sparks.length - SPARK_MAX);
+  }
+
+  // Bounce glint: a small, quiet flash at a ricochet point — NOT an explosion.
+  // The old bounce effect was a full orange explosion (36-48 big sparks) on
+  // every bounce of every laser, which filled the screen and got obnoxious.
+  // A bounce now leaves just a few small, short-lived, pale-cyan glints.
+  function spawnBounceFlash(x, y){
+    const n = 6;
+    for (let i=0;i<n;i++){
+      const ang = Math.random()*Math.PI*2;
+      const sp = 60 + 140*Math.random();
+      sparks.push({
+        x, y,
+        vx: Math.cos(ang)*sp,
+        vy: Math.sin(ang)*sp,
+        life: 0,
+        maxLife: 0.12 + 0.10*Math.random(),
+        r: 190,
+        g: 240,
+        b: 255,
+        size: 0.8 + 0.7*Math.random(),
       });
     }
     if (sparks.length > SPARK_MAX) sparks.splice(0, sparks.length - SPARK_MAX);
@@ -2685,6 +2815,14 @@ function startMenuMusic(){
     return t*t*(3-2*t);
   }
 
+  function bootSignGate(energySm){
+    // Map the (dB-compressed) analyser energy to a 0..1 sign drive.
+    // Measured on the Moses cannon file: silence ~0.02, zaps 0.34-0.75,
+    // slow build 0.55-0.67, the blast ~0.92, decay 0.85->0.73. A cubic curve
+    // keeps the build a dim glow and lets the blast flare to full.
+    return clamp(Math.pow(clamp(energySm, 0, 1), 3.0) * 1.4, 0, 1);
+  }
+
   function computeBootEnergy(){
     // Prefer real audio energy if we have an analyser, otherwise use a lightweight
     // time-domain pulse so boot visuals still feel alive even if WebAudio is unavailable.
@@ -2771,8 +2909,23 @@ function startMenuMusic(){
       ctx.stroke();
     }
 
-    // Neon sign text — flicker + "turn on" ramp
-    const ramp = smoothstep(0.0, 1.1, t);
+    // Neon sign text — flicker + "turn on" ramp.
+    // The sign follows the Moses cannon: it stays dim until the sound actually
+    // starts, then flares and flickers with the cannon's energy as it builds
+    // (zaps flicker it, the slow build glows it dimly, the ~12.25s blast flares
+    // it to full, and it dies with the sound in the trailing silence).
+    // bootEnergySm is the real analyser energy (0 while the file is silent).
+    // Fast attack / slow release: the tubes light with the sound and hold their
+    // glow between zaps instead of snapping black mid-boot.
+    // No analyser (WebAudio unavailable) -> fall back to the old time ramp.
+    let ramp;
+    if (bootAnalyser && bootFreq) {
+      const audioGate = bootSignGate(bootEnergySm);
+      bootSignHold = Math.max(audioGate, bootSignHold * 0.985);
+      ramp = bootSignHold;
+    } else {
+      ramp = smoothstep(0.0, 1.1, t);
+    }
     const flick = 0.82 + 0.18*Math.sin(t*33.0) + 0.12*Math.sin(t*71.0);
     const beat = 0.40*bootFlash + 0.25*bootEnergySm;
     const power = clamp(ramp * flick + beat, 0, 1.25);
@@ -3421,15 +3574,17 @@ function drawMenuScreen(now){
       ctx.globalCompositeOperation = 'source-over';
     }
 
-    // Rainbow logo button (after credits; not part of selection list)
+    // Hexagon button = NEO-VECTR Game Center sign-in (after credits; not part of selection list)
     rainbowBtnRect.visible = false;
     if (menuPage === 'MAIN') {
-      // Place just above the bottom navigation hint
+      // Clear of the bottom navigation hint: the button used to sit on top of it.
+      // Center the button well above the hint text, with the Game Center caption
+      // between the button and the hint.
       const btnW = fs*1.28;
       const btnH = fs*0.72;
       const btnX = a.cx - btnW*0.5;
       const navY = canvas.height - fs*0.25;
-      const btnY = navY - btnH*0.65;
+      const btnY = navY - fs*1.35;
 
       rainbowBtnRect = {x:btnX, y:btnY - btnH*0.5, w:btnW, h:btnH, visible:true};
 
@@ -3462,6 +3617,14 @@ function drawMenuScreen(now){
       ctx.textBaseline = 'middle';
       ctx.fillStyle = hover ? 'rgba(255,255,255,0.95)' : 'rgba(255,255,255,0.75)';
       ctx.fillText('⬡', a.cx, btnY+1);
+      // Caption: Game Center sign-in state (sits between the button and the nav hint)
+      ctx.globalCompositeOperation = 'source-over';
+      const gcName = gameCenterActiveName();
+      const gcCaption = gcName ? ('GAME CENTER • ' + gcName.slice(0, 10)) : 'GAME CENTER — SIGN IN';
+      ctx.font = `600 ${Math.floor(fs*0.18)}px system-ui, -apple-system, Segoe UI, Roboto, Arial`;
+      ctx.textBaseline = 'bottom';
+      ctx.fillStyle = 'rgba(255,255,255,0.45)';
+      ctx.fillText(gcCaption, a.cx, navY - fs*0.50);
       ctx.restore();
     }
 
@@ -3979,11 +4142,13 @@ function drawMenuScreen(now){
           const sp = Math.hypot(L.vx, L.vy) || 1;
           L.dirX = L.vx / sp;
           L.dirY = L.vy / sp;
-          playRicochetSfx();
-          spawnExplosion(L.x, L.y, 0.22 + 0.25*L.power);
+          // Bounce: a small quiet glint + a soft tick, NOT a full explosion.
+          playRicochetSfx(true);
+          spawnBounceFlash(L.x, L.y);
         } else {
+          // Final (3rd) collision: the laser dies in a real explosion.
           spawnExplosion(L.x, L.y, 0.65 + 0.55*L.power);
-          playRicochetSfx();
+          playZapSfx();
           lasers.splice(i, 1);
           continue;
         }
@@ -4085,17 +4250,20 @@ function drawMenuScreen(now){
 
     if (appMode === 'MENU') {
       // menu navigation (edge-triggered)
-      const up = keys.has('ArrowUp');
-      const down = keys.has('ArrowDown');
-      const enter = keys.has('Enter');
-      const left = keys.has('ArrowLeft');
-      const right = keys.has('ArrowRight');
-      const esc = keys.has('Escape');
+      // While the Game Center panel is open, the menu ignores all input
+      // (keys typed into the panel must not navigate the menu behind it).
+      const gcLocked = gameCenterOpen;
+      const up = !gcLocked && keys.has('ArrowUp');
+      const down = !gcLocked && keys.has('ArrowDown');
+      const enter = !gcLocked && keys.has('Enter');
+      const left = !gcLocked && keys.has('ArrowLeft');
+      const right = !gcLocked && keys.has('ArrowRight');
+      const esc = !gcLocked && keys.has('Escape');
 
       // Controller navigation (D-pad / left stick) + A/Start to select
       let gpUp = false, gpDown = false, gpLeft = false, gpRight = false, gpSelect = false, gpBack = false;
       const pads = getConnectedGamepads();
-      if (pads.length) {
+      if (!gcLocked && pads.length) {
         const gp = pads[0].pad;
         const ay = (gp.axes && gp.axes.length) ? gp.axes[1] : 0;
         gpUp = (gp.buttons && gp.buttons[12] && gp.buttons[12].pressed) || (ay < -0.55);
@@ -4154,26 +4322,24 @@ function drawMenuScreen(now){
       const fbY = fb.y;
       const hitBaseY = (menuPage === 'SETTINGS') ? (layout.bandTop - (settingsScrollY||0)) : layout.baseY;
       const hoverIdx = Math.round((fbY - hitBaseY) / layout.stepY);
-      if (fbX >= layout.left && fbX <= layout.right && hoverIdx >= 0 && hoverIdx < items.length) {
+      if (!gcLocked && fbX >= layout.left && fbX <= layout.right && hoverIdx >= 0 && hoverIdx < items.length) {
         menuSel = hoverIdx;
       }
-// Rainbow logo button (hold to view lobby list; short click = energy burst)
-if (mouseDown && !menuClickDown && rainbowBtnRect && rainbowBtnRect.visible && menuPage === 'MAIN') {
+// Hexagon button = NEO-VECTR Game Center sign-in (click opens the panel).
+// (Lobby stays on the corner lobby button + Tab.)
+if (!gcLocked && mouseDown && !menuClickDown && rainbowBtnRect && rainbowBtnRect.visible && menuPage === 'MAIN') {
   const inside = (fbX >= rainbowBtnRect.x && fbX <= (rainbowBtnRect.x+rainbowBtnRect.w) && fbY >= rainbowBtnRect.y && fbY <= (rainbowBtnRect.y+rainbowBtnRect.h));
   if (inside) {
     menuClickDown = true;
-    lobbyHoldActive = true;
-    lobbyHoldSource = 'button';
-    rainbowHoldT0 = performance.now();
-    showLobbyOverlay(false); // hold-visible
-    playMenuSwitchSfx();
-    log('INFO','Lobby list: HOLD (button)');
+    playMenuSelectSfx();
+    openGameCenter();
+    log('INFO','Game Center: opened (hexagon)');
   }
 }
 
 
       // Click/drag
-      if (mouseDown && !menuClickDown) {
+      if (!gcLocked && mouseDown && !menuClickDown) {
         menuClickDown = true;
         menuDragKey = null;
         if (fbX >= layout.left && fbX <= layout.right && hoverIdx >= 0 && hoverIdx < items.length) {
@@ -4443,6 +4609,24 @@ if (mouseDown && !menuClickDown && rainbowBtnRect && rainbowBtnRect.visible && m
           selectable: item.kind !== 'header'
         }));
       }
+    },
+
+    // NEO-VECTR Game Center sign-in (local arcade profile, no server)
+    gameCenter: {
+      open() { openGameCenter(); },
+      close() { closeGameCenter(); },
+      isOpen() { return gameCenterOpen; },
+      signIn(name) { const n = gameCenterSignIn(name); renderGameCenterPanel(); return n; },
+      signOut() { gameCenterSignOut(); renderGameCenterPanel(); },
+      deleteProfile(name) { gameCenterDeleteProfile(name); renderGameCenterPanel(); },
+      getState() {
+        return {
+          active: gameCenter.active,
+          profiles: gameCenter.profiles.map(p => p.name),
+        };
+      },
+      getActiveName() { return gameCenter.active; },
+      render() { renderGameCenterPanel(); },
     },
     
     // Game creation & control
@@ -4924,9 +5108,8 @@ Examples:
 <div id="lobbySymbol" title="Hold to view lobby"
  style="
  position:absolute;
- bottom:110px;
- left:50%;
- transform:translateX(-50%);
+ right:18px;
+ bottom:18px;
  cursor:pointer;
  opacity:0.92;
  user-select:none;
@@ -4982,6 +5165,47 @@ Examples:
  <p style="opacity:0.6;margin-top:24px;">release to close</p>
 </div>
 
+<!-- NEO-VECTR Game Center sign-in (local arcade profile, no server) -->
+<div id="gameCenterOverlay" style="
+ display:none;
+ position:fixed;
+ inset:0;
+ background:rgba(0,0,0,0.82);
+ z-index:10000;
+ align-items:center;
+ justify-content:center;
+">
+ <div id="gameCenterPanel" style="
+   width:min(420px, 92vw);
+   background:#0a0614;
+   border-radius:16px;
+   padding:22px 24px;
+   color:#eaffff;
+   font-family:system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+   border:2px solid transparent;
+   background:
+     linear-gradient(#0a0614, #0a0614) padding-box,
+     linear-gradient(90deg, rgba(255,110,199,0.9), rgba(126,234,255,0.9), rgba(255,233,120,0.9)) border-box;
+   box-shadow:0 0 32px rgba(140,255,255,0.25);
+ ">
+  <h2 style="margin:0 0 4px; font-size:20px; letter-spacing:2px; color:#7fffd4;">NEO-VECTR GAME CENTER</h2>
+  <p style="margin:0 0 14px; font-size:13px; opacity:0.65;">Arcade system sign-in — local profile, saved on this device.</p>
+  <div id="gameCenterStatus" style="margin:0 0 12px; font-size:14px; color:#fff;"></div>
+  <input id="gameCenterName" type="text" maxlength="24" placeholder="Arcade name" autocomplete="off" style="
+    width:100%; box-sizing:border-box; padding:10px 12px; margin-bottom:10px;
+    background:#120a24; color:#fff; border:1px solid rgba(126,234,255,0.5);
+    border-radius:8px; font-size:15px; outline:none;
+  " />
+  <div style="display:flex; gap:8px; margin-bottom:12px;">
+   <button id="gameCenterSignInBtn" style="flex:1; padding:10px; background:#1b5e54; color:#eaffff; border:none; border-radius:8px; font-size:14px; font-weight:700; cursor:pointer;">SIGN IN</button>
+   <button id="gameCenterSignOutBtn" style="flex:1; padding:10px; background:#3a2a12; color:#ffe9a8; border:none; border-radius:8px; font-size:14px; font-weight:700; cursor:pointer;">SIGN OUT</button>
+   <button id="gameCenterCloseBtn" style="flex:1; padding:10px; background:#222; color:#ccc; border:none; border-radius:8px; font-size:14px; cursor:pointer;">CLOSE</button>
+  </div>
+  <div id="gameCenterProfiles" style="font-size:14px;"></div>
+  <p style="margin:12px 0 0; font-size:11px; opacity:0.45;">Local arcade profile only — no online account. Online sign-in comes with the arcade system.</p>
+ </div>
+</div>
+
 <script>
 (function(){
  const sym = document.getElementById('lobbySymbol');
@@ -5011,6 +5235,39 @@ Examples:
  window.addEventListener('keyup', e=>{
    if(e.key === 'Tab') close();
  });
+})();
+</script>
+
+<script>
+// NEO-VECTR Game Center panel wiring (uses window.NEOVECTR.gameCenter).
+(function(){
+ const ov = document.getElementById('gameCenterOverlay');
+ const input = document.getElementById('gameCenterName');
+ const GC = window.NEOVECTR && window.NEOVECTR.gameCenter;
+ if (!ov || !GC) return;
+ function signInFromInput(){
+   const name = input ? input.value : '';
+   const signed = GC.signIn(name);
+   if (signed && input) input.value = '';
+ }
+ const signInBtn = document.getElementById('gameCenterSignInBtn');
+ const signOutBtn = document.getElementById('gameCenterSignOutBtn');
+ const closeBtn = document.getElementById('gameCenterCloseBtn');
+ if (signInBtn) signInBtn.addEventListener('click', signInFromInput);
+ if (signOutBtn) signOutBtn.addEventListener('click', () => { GC.signOut(); });
+ if (closeBtn) closeBtn.addEventListener('click', () => GC.close());
+ // Backdrop click closes.
+ ov.addEventListener('mousedown', (e) => { if (e.target === ov) GC.close(); });
+ // Keys inside the panel stay in the panel: stop them reaching bubble-phase
+ // window handlers (Tab/lobby). (The game's capture-phase key set is guarded
+ // separately by gameCenterOpen in the menu loop + keys.clear() on close.)
+ ov.addEventListener('keydown', (e) => {
+   e.stopPropagation();
+   if (e.key === 'Escape') GC.close();
+   else if (e.key === 'Enter' && e.target === input) signInFromInput();
+ });
+ ov.addEventListener('keyup', (e) => { e.stopPropagation(); });
+ ov.addEventListener('keypress', (e) => { e.stopPropagation(); });
 })();
 </script>
 
